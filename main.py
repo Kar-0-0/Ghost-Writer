@@ -6,11 +6,16 @@ from tqdm import tqdm
 
 # Hyperparameters -----------
 device = 'mps'
-context_length = 8
-n_emb = 64
-n_heads = 8
+context_length = 200
+n_emb = 360
+n_heads = 6
 dropout = 0.2
 head_size = n_emb // n_heads
+n_layers = 5
+epochs = 2000
+batch_size = 32
+learning_rate = 1e-3
+epoch_intervals = 500
 # ---------------------------
 
 print(f'Using {device}')
@@ -25,26 +30,31 @@ train = dataset[0:(len(dataset)*9)//10]
 val = dataset[(len(dataset)*9)//10:]
 
 stoi = {s:i for i, s in enumerate(vocab)}
-itos = {i:s for i, s in stoi.items()}
+itos = {i:s for s, i in stoi.items()}
 
 def encode(sx): return torch.tensor([stoi[x] for x in sx], dtype=torch.int32, device=device)
 def decode(ix): return [itos[x] for x in ix]
 
-train = encode(train)
-val = encode(val)
+train_tens = encode(train)
+val_tens = encode(val)
+import random 
 
+ran_num = random.randint(0, 6)
+# print(''.join(decode(train_tens[ran_num:ran_num+context_length].tolist())))
+# print('\n' + ''.join(decode(train_tens[ran_num+1:ran_num+context_length+1].tolist())))
+# exit(0)
 
 def get_batch(type, batch_size, context_length):
     assert type == 'train' or type == 'val'
     if type == 'train':
-        batch = torch.randint(0, len(train) - context_length, (batch_size,))
+        batch = torch.randint(0, len(train_tens) - context_length, (batch_size,))
     else:
-        batch = torch.randint(0, len(val) - context_length, (batch_size,))
+        batch = torch.randint(0, len(val_tens) - context_length, (batch_size,))
 
-    x = train if type == 'train' else val
+    x = train_tens if type == 'train' else val_tens
 
-    x = torch.stack([train[b:b+context_length] for b in batch])
-    y = torch.stack([train[b+1:b+context_length+1] for b in batch])
+    x = torch.stack([train_tens[b:b+context_length] for b in batch])
+    y = torch.stack([train_tens[b+1:b+context_length+1] for b in batch])
     
     return x, y
 
@@ -55,16 +65,16 @@ class SelfAttentionHead(nn.Module):
         self.query = nn.Linear(emb_dim, head_size, bias=False, device=device)
         self.key = nn.Linear(emb_dim, head_size, bias=False, device=device)
         self.value = nn.Linear(emb_dim, head_size, bias=False, device=device)
-        self.register_buffer('tril', torch.ones(context_length, context_length, device=device))
+        self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length, device=device)))
 
     def forward(self, x):
-        _, T, _ = x.shape
+        _, T, C = x.shape
 
         q = self.query(x) # (B, T, C)
         k = self.key(x)   # (B, T, C)
         v = self.value(x) # (B, T, C)
         
-        scores = q @ k.transpose(-2, -1) # (B, T, C) @ (B, C, T) ---> (B, T, T)
+        scores = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) ---> (B, T, T)
         scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         scores = F.softmax(scores, dim=-1)
         
@@ -77,10 +87,10 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.head_size = n_emb // n_heads
         self.heads = nn.ModuleList([SelfAttentionHead(n_emb, self.head_size) for _ in range(n_heads)])
-        self.proj = nn.Linear(n_emb, n_emb)
+        self.proj = nn.Linear(head_size*n_heads, n_emb)
     
     def forward(self, x):
-        x = torch.cat([h(x) for h in self.heads])
+        x = torch.cat([h(x) for h in self.heads], dim=-1)
         x = self.proj(x)
         
         return x
@@ -133,10 +143,43 @@ class LyricModel(nn.Module):
         x = tok_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
-        x = self.fcl(x)
-        x = F.softmax(x)
+        x = self.fcl(x) # (B, T, C) ---> (B, T, vocab_length)
 
         return x
 
     def generate(self, idx, characters):
-        pass
+        for _ in range(characters):
+            # idx.shape ---> (B, T)
+            ix = idx[:, -context_length:] # Getting all batches and the last context length of tokens
+            logits = self(ix) # returns softmax((B, T, C))
+            recent_ix = logits[:, -1, :] # slices so we get ---> (B, last T, C)
+            probs = F.softmax(recent_ix, dim=-1)
+            new_ix = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, new_ix), dim=1) # (B, T+1)
+
+        return idx
+
+
+lm = LyricModel(n_layers, n_heads, n_emb)
+lm = lm.to(device)
+lm = lm.to(memory_format=torch.channels_last)
+
+optimizer = torch.optim.AdamW(lm.parameters(), lr=learning_rate)
+
+for epoch in tqdm(range(epochs), desc=f'Epoch %'):
+    x_batch, y_batch = get_batch('train', batch_size, context_length)
+    logits = lm(x_batch)
+    B, T, C = logits.shape
+    targets = y_batch.view(B*T)
+    logits = logits.view(B*T, C)
+    loss = F.cross_entropy(logits, targets)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % epoch_intervals == 0:
+        print(f'Epoch: {epoch}, Loss: {loss.item()}')
+
+
+idx = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(''.join(decode(lm.generate(idx, 1000)[0].tolist())))
